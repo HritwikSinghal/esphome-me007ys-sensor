@@ -11,10 +11,10 @@ Reads the sensor over UART and publishes distance in **centimeters**, with built
 - Upper bound: always **NaN** + status `too_far`
 - Robustness:
   - `guard_cm` — ignore a band above `min_valid_cm` (default 5.0)
-  - `max_step_cm` — reject single-frame jumps (0=off)
-  - `require_consecutive` — publish only after N similar frames
+  - `max_step_cm` -- hold back spikes; a sustained change becomes the new level (0=off)
+  - `require_consecutive` -- confirm a new level over N similar frames
 - Diagnostics:
-  - `frame_rate_hz` (Hz), `status` text (`ok`, `too_close`, `too_far`, `checksum_error`, `idle`)
+  - `frame_rate_hz` (Hz), `status` text (`ok`, `settling`, `too_close`, `too_far`, `checksum_error`, `idle`)
   - `raw_mm` (mm) with `raw_mm_policy: all|valid_only`
 - Optional `debug_raw` for byte-level logging
 
@@ -62,6 +62,31 @@ external_components:
 | TX  | UART RX pin (`rx_pin`) |
 | RX  | optional, see below |
 
+```mermaid
+flowchart LR
+  subgraph ESP["ESP32"]
+    E5V["5V / VIN"]
+    EGND["GND"]
+    ERX["GPIO16 (UART RX)"]
+    ETX["GPIO17 (UART TX)"]
+    E33["3V3"]
+  end
+  subgraph SEN["ME007YS (SEN0312)"]
+    SVCC["VCC"]
+    SGND["GND"]
+    STX["TX"]
+    SRX["RX"]
+  end
+  subgraph I2C["Other sensors / display"]
+    IVCC["VCC"]
+  end
+  E5V ---|"5V power"| SVCC
+  EGND ---|"common ground"| SGND
+  STX -->|"data, 9600 baud (1k/2k divider if TX reads ~5V)"| ERX
+  ETX -.->|"optional: HIGH or floating = processed, LOW = real-time"| SRX
+  E33 ---|"keep 3.3V devices on 3V3"| IVCC
+```
+
 The sensor's RX pin selects its output mode, not a command channel:
 - **Floating or HIGH**: processed (filtered) value every 100-300 ms. Recommended.
 - **LOW**: real-time value every 100 ms.
@@ -89,22 +114,15 @@ sensor:
     max_valid_cm: 450.0
     too_close_behavior: nan
     guard_cm: 0.0
-    max_step_cm: 0.0          # keep off, see Known issues
-    require_consecutive: 1
-    filters:
-      - median:               # smooth jitter with ESPHome's built-in filter
-          window_size: 5
-          send_every: 1
+    max_step_cm: 120.0        # spikes held back; a real change is accepted after 3 agreeing frames
+    require_consecutive: 2
     raw_mm:
       name: "ME007YS Raw Distance (mm)"
-      entity_category: diagnostic
     raw_mm_policy: all   # show every reading while setting up; switch to valid_only later
     frame_rate_hz:
       name: "ME007YS Frame Rate"
-      entity_category: diagnostic
     status:
       name: "ME007YS Status"
-      entity_category: diagnostic
 ```
 
 Readings under `min_valid_cm + guard_cm` (28 cm here) report NaN with status `too_close`. Raise `guard_cm` only if you see false readings just above the blind zone.
@@ -120,18 +138,18 @@ All standard [sensor](https://esphome.io/components/sensor/) options also apply.
 | Option | Default | Description |
 |---|---|---|
 | `uart_id` | -- | UART bus the sensor is on (required if more than one UART). |
-| `update_interval` | `500ms` | How often the distance is published. |
+| `update_interval` | `500ms` | How often states are published (one per interval, from the latest frame). Frames are parsed continuously. |
 | `min_valid_cm` | `28.0` | Lower limit; the sensor's blind zone is 0-28 cm. Effective cutoff is `min_valid_cm + guard_cm`. |
 | `max_valid_cm` | `450.0` | Readings at or above this publish NaN with status `too_far`. |
 | `too_close_behavior` | `nan` | `nan`, `min` (publish `min_valid_cm`) or `last` (hold last value). |
 | `guard_cm` | `5.0` | Extra band above `min_valid_cm` also treated as too close. |
-| `max_step_cm` | `0.0` | Reject single-frame jumps larger than this; `0` disables. See Known issues. |
-| `require_consecutive` | `1` | Publish only after N similar frames (1-10). See Known issues. |
+| `max_step_cm` | `0.0` | Hold back jumps larger than this from the last accepted value; a jump that persists for `max(require_consecutive, 3)` agreeing frames is accepted as the new level. `0` disables. |
+| `require_consecutive` | `1` | A new level is published once N consecutive frames agree within 1 cm (1-10); after that every agreeing frame publishes. |
 | `raw_mm` | -- | Optional sensor: raw distance in mm after checksum check. |
 | `raw_mm_policy` | `all` | `all` or `valid_only` (NaN when out of range). |
 | `frame_rate_hz` | -- | Optional sensor: frames parsed per `update_interval`. |
-| `status` | -- | Optional text sensor: `ok`, `too_close`, `too_far`, `checksum_error`, `idle` (no bytes received). |
-| `debug_raw` | `false` | Log raw UART bytes. |
+| `status` | -- | Optional text sensor: `ok`, `too_close`, `too_far`, `checksum_error`, `idle` (no frames this interval), `settling` (in range, waiting for confirmation). Published only on change. |
+| `debug_raw` | `false` | Log every frame at DEBUG level. |
 
 ## Troubleshooting
 - **"Could not find components folder for source"**: the source repo has no `components/` or `esphome/components/` folder. Versions of this repo before the rename used `external_components/`; ESPHome caches git sources for a day by default, so run **Clean Build Files** in the dashboard (or set `refresh: 0s` once) to pick up the new layout.
@@ -141,9 +159,5 @@ All standard [sensor](https://esphome.io/components/sensor/) options also apply.
 - **Frame rate around 2 Hz**: observed on a working unit in processed mode; not a fault. The datasheet quotes a 100-300 ms response time, but real output is slower.
 - **Frequent `checksum_error`**: check wiring and grounding; long unshielded runs pick up noise.
 - **Raw distance often exactly 280 mm**: the sensor reports its 28 cm floor when it cannot get a proper echo, i.e. something is in the 0-28 cm blind zone or the beam hits a nearby wall, pipe or lid. Remount further from the surface or aim it straighter.
-- **Raw distance changes but the distance sensor does not**: see Known issues (`max_step_cm`, `require_consecutive`).
+- **Status `settling` and the distance does not change**: readings are in range but not confirmed yet. Expected for a few frames after a jump with `require_consecutive` or `max_step_cm`; if it persists, readings are jittering more than 1 cm. Lower `require_consecutive` or add a `median` filter.
 
-## Known issues
-- **`max_step_cm` can freeze the reading.** Each frame is compared with the last *published* value, and rejected frames never update it. After a real change larger than the limit (tank refilled, sensor remounted), every later frame is rejected and the distance never updates. Keep it at `0` and use ESPHome filters (`median`, `delta`) instead.
-- **`require_consecutive` slows updates.** The streak resets after every publish, so each update needs N fresh frames within 1 cm of each other. At about 2 frames/s, `require_consecutive: 3` means at most one update every 1.5 s, and any jitter restarts the count. Use `1` with a `median` filter.
-- **Every frame is published.** Distance, `raw_mm` and `status` are published for each parsed frame, even when unchanged. Add a `throttle` or `delta` filter if this floods Home Assistant's recorder.

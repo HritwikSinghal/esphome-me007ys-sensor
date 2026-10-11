@@ -26,17 +26,14 @@ sensor:
     max_valid_cm: 450.0
     too_close_behavior: nan
     guard_cm: 0.0
-    max_step_cm: 0.0          # keep off, see README Known issues
-    require_consecutive: 1
+    max_step_cm: 120.0        # spikes held back; a real change is accepted after 3 agreeing frames
+    require_consecutive: 2
     frame_rate_hz:
       name: "ME007YS Frame Rate"
-      entity_category: diagnostic
     status:
       name: "ME007YS Status"
-      entity_category: diagnostic
     raw_mm:
       name: "ME007YS Raw Distance (mm)"
-      entity_category: diagnostic
     raw_mm_policy: valid_only
 
   # Inches view that stays in sync with cm (Option A)
