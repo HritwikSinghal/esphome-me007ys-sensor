@@ -1,4 +1,7 @@
 #include "me007ys_sensor.h"
+#include <algorithm>
+#include <cstring>
+#include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
@@ -6,140 +9,208 @@ namespace me007ys {
 
 static const char *const TAG = "me007ys";
 
-void ME007YSSensor::update() {
-  // Parse frames: [0xFF][HIGH][LOW][SUM]
-  uint32_t valid_frames = 0;
-  bool any_bytes = false;
+// Frames within this distance of the previous one count as "the same reading".
+static const float SIM_TOL_MM = 10.0f;
+// A sustained jump beyond max_step_cm is accepted after at least this many agreeing frames.
+static const uint8_t MIN_STEP_CONFIRM = 3;
+// The sensor's frame period (~500 ms observed) can match update_interval, so an interval
+// with no frame is normal; only report idle after this long without any frame.
+static const uint32_t IDLE_TIMEOUT_MS = 3000;
 
-  while (this->available() >= 4) {
-    any_bytes = true;
+static uint8_t frame_checksum(const uint8_t *f) { return static_cast<uint8_t>(f[0] + f[1] + f[2]); }
 
-    uint8_t start = this->read();
-    if (this->debug_raw_) ESP_LOGVV(TAG, "RX start: 0x%02X", start);
-    if (start != 0xFF) continue;  // resync
+void ME007YSSensor::setup() {
+  this->last_update_ms_ = millis();
+  this->last_frame_ms_ = this->last_update_ms_;
+}
 
-    int h = this->read();
-    int l = this->read();
-    int s = this->read();
-    if (h < 0 || l < 0 || s < 0) break;
+void ME007YSSensor::loop() {
+  // Frame: [0xFF][HIGH][LOW][SUM], SUM = (0xFF + HIGH + LOW) & 0xFF
+  uint8_t byte;
+  while (this->available() > 0 && this->read_byte(&byte)) {
+    if (this->buf_len_ == 0 && byte != 0xFF)
+      continue;
+    this->buf_[this->buf_len_++] = byte;
+    if (this->buf_len_ < 4)
+      continue;
 
-    uint8_t high = static_cast<uint8_t>(h);
-    uint8_t low  = static_cast<uint8_t>(l);
-    uint8_t sum  = static_cast<uint8_t>(s);
-    uint8_t calc_sum = static_cast<uint8_t>((0xFF + high + low) & 0xFF);
+    if (this->debug_raw_) {
+      ESP_LOGD(TAG, "Frame: %02X %02X %02X %02X (calc %02X)", this->buf_[0], this->buf_[1], this->buf_[2],
+               this->buf_[3], frame_checksum(this->buf_));
+    }
 
-    if (this->debug_raw_) ESP_LOGVV(TAG, "FRAME: ff %02x %02x %02x (calc=%02x)", high, low, sum, calc_sum);
-
-    if (sum != calc_sum) {
-      ESP_LOGW(TAG, "Checksum mismatch: got 0x%02X, expected 0x%02X", sum, calc_sum);
-      this->publish_status_("checksum_error");
+    // HIGH can never be 0xFF (max range 4500 mm = 0x1194). A window starting on a 0xFF data
+    // byte can still pass the checksum (e.g. 511 mm = FF 01 FF FF), so treat it as misaligned.
+    if (this->buf_[1] != 0xFF && this->buf_[3] == frame_checksum(this->buf_)) {
+      this->handle_frame_((static_cast<uint16_t>(this->buf_[1]) << 8) | this->buf_[2]);
+      this->buf_len_ = 0;
       continue;
     }
 
-    const uint16_t distance_mm = (static_cast<uint16_t>(high) << 8) | low;
-
-    // raw_mm: ALL -> publish now, VALID_ONLY -> publish later if accepted
-    if (this->raw_mm_sensor_ != nullptr && this->raw_policy_ == RawPolicy::ALL) {
-      this->raw_mm_sensor_->publish_state(distance_mm);
-    }
-
-    // Lower bound + guard band
-    const uint16_t guard_min_mm = static_cast<uint16_t>(this->min_valid_mm_ + this->guard_mm_);
-    if (distance_mm <= this->min_valid_mm_ || distance_mm < guard_min_mm) {
-      if (this->raw_mm_sensor_ != nullptr && this->raw_policy_ == RawPolicy::VALID_ONLY) {
-        this->raw_mm_sensor_->publish_state(NAN);
+    // Bad frame: the 0xFF we synced on may have been a data byte. Resync on the next 0xFF
+    // inside the buffer instead of discarding all four bytes, so a real frame is not lost.
+    this->checksum_errors_++;
+    uint8_t keep = 0;
+    for (uint8_t i = 1; i < 4; i++) {
+      if (this->buf_[i] == 0xFF) {
+        keep = 4 - i;
+        memmove(this->buf_, this->buf_ + i, keep);
+        break;
       }
+    }
+    this->buf_len_ = keep;
+  }
+}
 
+void ME007YSSensor::handle_frame_(uint16_t distance_mm) {
+  this->frames_++;
+  this->last_frame_ms_ = millis();
+  this->latest_raw_mm_ = distance_mm;
+  const float d = distance_mm;
+
+  if (d < this->min_valid_mm_ + this->guard_mm_ || d >= this->max_valid_mm_) {
+    this->outcome_ = (d >= this->max_valid_mm_) ? FrameOutcome::TOO_FAR : FrameOutcome::TOO_CLOSE;
+    this->last_candidate_mm_ = NAN;
+    this->streak_ = 0;
+    this->step_candidate_mm_ = NAN;
+    this->step_streak_ = 0;
+    return;
+  }
+
+  bool rebaselined = false;
+  if (this->max_step_mm_ > 0.0f && !std::isnan(this->last_accepted_mm_) &&
+      fabsf(d - this->last_accepted_mm_) > this->max_step_mm_) {
+    // Compare against the jump candidate, not only the stale reference, so a real level
+    // change is eventually accepted instead of being rejected until reboot.
+    if (!std::isnan(this->step_candidate_mm_) && fabsf(d - this->step_candidate_mm_) <= SIM_TOL_MM) {
+      if (this->step_streak_ < 255)
+        this->step_streak_++;
+    } else {
+      this->step_streak_ = 1;
+    }
+    this->step_candidate_mm_ = d;
+
+    const uint8_t needed = std::max(this->require_consecutive_, MIN_STEP_CONFIRM);
+    if (this->step_streak_ < needed) {
+      if (this->outcome_ != FrameOutcome::OK)
+        this->outcome_ = FrameOutcome::PENDING;
+      this->last_candidate_mm_ = NAN;
+      this->streak_ = 0;
+      return;
+    }
+    rebaselined = true;
+  }
+  this->step_candidate_mm_ = NAN;
+  this->step_streak_ = 0;
+
+  if (rebaselined) {
+    // The step-confirm frames already agreed with each other; no second confirmation round.
+    this->streak_ = this->require_consecutive_;
+  } else if (std::isnan(this->last_candidate_mm_) || fabsf(d - this->last_candidate_mm_) <= SIM_TOL_MM) {
+    if (this->streak_ < 255)
+      this->streak_++;
+  } else {
+    this->streak_ = 1;
+  }
+  this->last_candidate_mm_ = d;
+
+  // The streak is not reset on accept: once N frames agree, every further agreeing frame
+  // publishes, instead of one publish per N frames.
+  if (this->streak_ < this->require_consecutive_) {
+    if (this->outcome_ != FrameOutcome::OK)
+      this->outcome_ = FrameOutcome::PENDING;
+    return;
+  }
+
+  this->last_accepted_mm_ = d;
+  this->outcome_ = FrameOutcome::OK;
+}
+
+void ME007YSSensor::update() {
+  const uint32_t now = millis();
+  const uint32_t elapsed_ms = now - this->last_update_ms_;
+  this->last_update_ms_ = now;
+
+  if (this->frame_rate_sensor_ != nullptr && elapsed_ms > 0)
+    this->frame_rate_sensor_->publish_state(this->frames_ * 1000.0f / elapsed_ms);
+
+  if (this->checksum_errors_ > 0)
+    ESP_LOGW(TAG, "%u frame(s) failed checksum since last update", (unsigned) this->checksum_errors_);
+
+  const bool raw_all = this->raw_policy_ == RawPolicy::ALL;
+  switch (this->outcome_) {
+    case FrameOutcome::NONE:
+      // Keep the last distance; a disconnected sensor shows up in status, not as a fake value.
+      if (this->checksum_errors_ > 0)
+        this->publish_status_("checksum_error");
+      else if (now - this->last_frame_ms_ >= std::max(IDLE_TIMEOUT_MS, 2 * this->get_update_interval()))
+        this->publish_status_("idle");
+      break;
+
+    case FrameOutcome::OK:
+      this->publish_state(this->last_accepted_mm_ / 10.0f);
+      this->publish_status_("ok");
+      if (this->raw_mm_sensor_ != nullptr)
+        this->raw_mm_sensor_->publish_state(raw_all ? this->latest_raw_mm_ : this->last_accepted_mm_);
+      break;
+
+    case FrameOutcome::PENDING:
+      // In range but not confirmed yet (require_consecutive / max_step_cm): no new distance.
+      this->publish_status_("settling");
+      if (this->raw_mm_sensor_ != nullptr && raw_all)
+        this->raw_mm_sensor_->publish_state(this->latest_raw_mm_);
+      break;
+
+    case FrameOutcome::TOO_CLOSE:
       switch (this->too_close_behavior_) {
-        case OutOfRangeBehavior::PUBLISH_LIMIT: {
-          const float cm = this->min_valid_mm_ / 10.0f;
-          this->publish_state(cm);
-          this->last_valid_cm_ = cm;
+        case OutOfRangeBehavior::PUBLISH_LIMIT:
+          this->publish_state(this->min_valid_mm_ / 10.0f);
           break;
-        }
-        case OutOfRangeBehavior::HOLD_LAST: {
-          if (!std::isnan(this->last_valid_cm_)) this->publish_state(this->last_valid_cm_);
-          else this->publish_state(NAN);
+        case OutOfRangeBehavior::HOLD_LAST:
+          this->publish_state(std::isnan(this->last_accepted_mm_) ? NAN : this->last_accepted_mm_ / 10.0f);
           break;
-        }
         case OutOfRangeBehavior::NAN_OUT:
         default:
           this->publish_state(NAN);
           break;
       }
-      this->last_candidate_cm_ = NAN;
-      this->streak_ = 0;
       this->publish_status_("too_close");
-      valid_frames++;
-      continue;
-    }
+      if (this->raw_mm_sensor_ != nullptr)
+        this->raw_mm_sensor_->publish_state(raw_all ? this->latest_raw_mm_ : NAN);
+      break;
 
-    // Upper bound: always NaN + too_far
-    if (distance_mm >= this->max_valid_mm_) {
-      if (this->raw_mm_sensor_ != nullptr && this->raw_policy_ == RawPolicy::VALID_ONLY) {
-        this->raw_mm_sensor_->publish_state(NAN);
-      }
+    case FrameOutcome::TOO_FAR:
       this->publish_state(NAN);
-      this->last_candidate_cm_ = NAN;
-      this->streak_ = 0;
       this->publish_status_("too_far");
-      valid_frames++;
-      continue;
-    }
-
-    // Candidate valid reading
-    const float cm = distance_mm / 10.0f;
-
-    // Step limiter (vs last published)
-    if (this->max_step_mm_ > 0 && !std::isnan(this->last_published_cm_)) {
-      float step_cm = fabsf(cm - this->last_published_cm_);
-      if (step_cm * 10.0f > this->max_step_mm_) {
-        this->last_candidate_cm_ = NAN;
-        this->streak_ = 0;
-        valid_frames++;
-        continue;
-      }
-    }
-
-    // Consecutive confirmation (within 1.0 cm similarity)
-    const float SIM_TOL_CM = 1.0f;
-    if (std::isnan(this->last_candidate_cm_) || fabsf(cm - this->last_candidate_cm_) <= SIM_TOL_CM) {
-      if (this->streak_ < 255) this->streak_++;
-    } else {
-      this->streak_ = 1;
-    }
-    this->last_candidate_cm_ = cm;
-
-    if (this->streak_ < this->require_consecutive_) {
-      valid_frames++;
-      continue;
-    }
-
-    // Accept and publish
-    this->publish_state(cm);
-    this->last_valid_cm_ = cm;
-    this->last_published_cm_ = cm;
-    this->streak_ = 0;
-    this->last_candidate_cm_ = NAN;
-    this->publish_status_("ok");
-
-    // raw_mm: VALID_ONLY -> publish now (accepted in-range mm)
-    if (this->raw_mm_sensor_ != nullptr && this->raw_policy_ == RawPolicy::VALID_ONLY) {
-      this->raw_mm_sensor_->publish_state(distance_mm);
-    }
-
-    valid_frames++;
+      if (this->raw_mm_sensor_ != nullptr)
+        this->raw_mm_sensor_->publish_state(raw_all ? this->latest_raw_mm_ : NAN);
+      break;
   }
 
-  // Frame rate over polling window (optional)
-  if (this->frame_rate_sensor_ != nullptr) {
-    float dt_s = this->get_update_interval() / 1000.0f;
-    if (dt_s <= 0.0f) dt_s = 0.5f;
-    float rate_hz = valid_frames / dt_s;
-    this->frame_rate_sensor_->publish_state(rate_hz);
-  }
+  this->outcome_ = FrameOutcome::NONE;
+  this->frames_ = 0;
+  this->checksum_errors_ = 0;
+}
 
-  if (!any_bytes) this->publish_status_("idle");
+void ME007YSSensor::publish_status_(const char *s) {
+  // Text sensors do not dedup, so only publish on change.
+  if (this->status_sensor_ == nullptr || (this->last_status_ != nullptr && strcmp(this->last_status_, s) == 0))
+    return;
+  this->last_status_ = s;
+  this->status_sensor_->publish_state(s);
+}
+
+void ME007YSSensor::dump_config() {
+  LOG_SENSOR("", "ME007YS", this);
+  LOG_UPDATE_INTERVAL(this);
+  ESP_LOGCONFIG(TAG,
+                "  Valid range: %.1f - %.1f cm (guard %.1f cm)\n"
+                "  Max step: %.1f cm, require consecutive: %u",
+                this->min_valid_mm_ / 10.0f, this->max_valid_mm_ / 10.0f, this->guard_mm_ / 10.0f,
+                this->max_step_mm_ / 10.0f, (unsigned) this->require_consecutive_);
+  LOG_SENSOR("  ", "Raw distance", this->raw_mm_sensor_);
+  LOG_SENSOR("  ", "Frame rate", this->frame_rate_sensor_);
+  LOG_TEXT_SENSOR("  ", "Status", this->status_sensor_);
 }
 
 }  // namespace me007ys
