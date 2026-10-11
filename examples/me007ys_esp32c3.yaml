@@ -3,9 +3,7 @@ esphome:
   friendly_name: ME007YS Example ESP32-C3
 
 external_components:
-  - source:
-      type: local
-      path: ./external_components
+  - source: github://HritwikSinghal/esphome-me007ys-sensor
     components: [me007ys]
 
 logger:
@@ -27,9 +25,9 @@ sensor:
     min_valid_cm: 28.0
     max_valid_cm: 450.0
     too_close_behavior: nan
-    guard_cm: 12.0
-    max_step_cm: 120.0
-    require_consecutive: 3
+    guard_cm: 0.0
+    max_step_cm: 0.0          # keep off, see README Known issues
+    require_consecutive: 1
     frame_rate_hz:
       name: "ME007YS Frame Rate"
       entity_category: diagnostic
