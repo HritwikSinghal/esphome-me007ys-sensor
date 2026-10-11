@@ -10,6 +10,7 @@ from esphome.const import (
 )
 
 DEPENDENCIES = ["uart"]
+AUTO_LOAD = ["sensor", "text_sensor"]
 
 me007ys_ns = cg.esphome_ns.namespace("me007ys")
 ME007YSSensor = me007ys_ns.class_("ME007YSSensor", sensor.Sensor, cg.PollingComponent, uart.UARTDevice)
