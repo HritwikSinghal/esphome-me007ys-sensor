@@ -10,3 +10,5 @@ __pycache__/
 *.swp
 .env
 secrets.yaml
+tests/host/harness
+tests/host/edge
